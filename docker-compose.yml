@@ -1,0 +1,7 @@
+services:
+  okxstopi:
+    build: .
+    container_name: okxstopi
+    restart: unless-stopped
+    env_file:
+      - .env
