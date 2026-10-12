@@ -1,6 +1,10 @@
 # OKXSTOP
   
-Экстренный стоп-кран для OKX (аварийный выключатель для торговых терминалов, таких как MoonTrader). Скрипт отслеживает изменения лимитных ордеров (переставление), и в случае зависания терминала или падения сервера - закрывает все ордера и открытые позиции.  
+Экстренный стоп-кран для OKX (аварийный выключатель для торговых терминалов, таких как MoonTrader и MoonBot). Скрипт отслеживает изменения лимитных ордеров (переставление), и в случае зависания терминала или падения сервера - закрывает все ордера и открытые позиции.
+
+С тем же интервалом (`CHECK_INTERVAL`) опрашивает историю закрытых фьючерсных позиций. Когда сделка уже есть в истории, в Telegram уходят только пара, сумма в долларах, профит/убыток, % PnL и в конце баланс торгового счёта (USDT equity).
+
+Та же сводка приходит каждый час и в полночь по `REPORT_TIMEZONE` — полным отчётом за прошедшие сутки. Сделки, закрытые до запуска скрипта, в личные сообщения не дублируются; часовой и суточный отчёты считают только закрытия после старта.
   
 Также присылает отбивки и статистику в Telegram в формате:  
   
@@ -13,29 +17,50 @@ Orders: 0
 Positions: 0  
 Timeout: 120s  
 Check interval: 10s  
+Trade alerts: on close, hourly, and daily  
 Panic threshold: 3 (sleep mode after)  
   
 ---  
   
 📊 OKXSTOPI HOURLY REPORT  
   
-Period: 2026-06-18 13:47 UTC — 2026-06-18 14:00 UTC  
+Period: 2026-06-18 18:00 UTC — 2026-06-18 19:00 UTC  
   
-Trades: 0  
-Volume: 0.00 USDT  
-Realized PnL: +0.00 USDT  
-Fees: +0.00 USDT  
-Net PnL: +0.00 USDT  
-Balance change: +0.00 USDT  
+BTC-USDT-SWAP LONG  
+Amount: 1250.40 USDT  
+PnL: +12.35 USDT (+9.88%)  
   
-💰 Balance: 4987.40 USDT  
-Unrealized PnL: +0.00 USDT  
-Open orders: 96  
-Open positions: 0  
+Trades: 1  
+Amount: 1250.40 USDT  
+PnL: +12.35 USDT (+9.88%)  
   
 Status: ✅ OK  
-Last order activity: 0s ago  
+Last order activity: 12s ago  
+Open orders: 96  
+Open positions: 0  
 Panic events: 0/3  
+  
+💰 Balance: 5012.40 USDT  
+  
+---  
+  
+📆 OKXSTOPI DAILY REPORT  
+  
+Period: 2026-06-18 00:00 UTC — 2026-06-19 00:00 UTC  
+  
+BTC-USDT-SWAP LONG  
+Amount: 1250.40 USDT  
+PnL: +12.35 USDT (+9.88%)  
+  
+ETH-USDT-SWAP SHORT  
+Amount: 400.00 USDT  
+PnL: -1.20 USDT (-3.00%)  
+  
+Trades: 2  
+Amount: 1650.40 USDT  
+PnL: +11.15 USDT (+6.20%)  
+  
+💰 Balance: 5012.40 USDT  
   
 ---  
   
@@ -67,6 +92,30 @@ Activity detected - Watchdog is active again!
   
 ---  
   
+📈 TRADE CLOSED  
+  
+BTC-USDT-SWAP LONG  
+Amount: 1250.40 USDT  
+PnL: +12.35 USDT (+9.88%)  
+  
+💰 Balance: 5012.40 USDT  
+  
+---  
+  
+📈 TRADES CLOSED (2)  
+  
+BTC-USDT-SWAP LONG  
+Amount: 1250.40 USDT  
+PnL: +12.35 USDT (+9.88%)  
+  
+ETH-USDT-SWAP SHORT (partial)  
+Amount: 400.00 USDT  
+PnL: -1.20 USDT (-3.00%)  
+  
+💰 Balance: 5012.40 USDT  
+  
+---  
+  
 ## Установка  
   
 git clone https://github.com/Tkom3a/OKXstopi.git  
@@ -88,3 +137,4 @@ docker logs -f okxstopi
   
 docker-compose down  
 docker rmi okxstopi_okxstopi  
+# OKXmbStop
