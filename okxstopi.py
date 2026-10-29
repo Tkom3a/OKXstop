@@ -27,6 +27,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT", "120"))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))  # How often to check orders
+PROFIT_ALERT_USD = float(os.getenv("PROFIT_ALERT_USD", "5"))
+LOSS_ALERT_USD = float(os.getenv("LOSS_ALERT_USD", "15"))
+# Sent alone so Telegram shows them large. No other emoji in the script.
+ROCKET_ALERT = "🚀"
+CLOWN_ALERT = "🤡"
 STARTUP_GRACE = int(os.getenv("STARTUP_GRACE", "30"))
 REPORT_TZ = ZoneInfo(os.getenv("REPORT_TIMEZONE", "UTC"))
 PANIC_THRESHOLD = int(os.getenv("PANIC_THRESHOLD", "3"))  # Максимум паник до "сна"
@@ -41,6 +46,7 @@ class State:
     panic_events = 0
     last_report_time = _now
     last_report_balance = 0.0
+    day_open_balance = None
     last_hour_reported = None
     orders_cache = []  # Cache for order comparison
     last_orders_count = 0
@@ -49,6 +55,10 @@ class State:
     has_activity_since_sleep = False  # Была ли активность во время сна
     position_snapshots = {}  # posId -> last seen closed-position snapshot
     trade_events = []  # closed trades already taken from exchange history
+    seen_order_ids = []
+    seen_lookup = set()
+    order_history_ready = False
+    cancel_attempted = set()
     next_report_at = None  # next clock-hour boundary in REPORT_TZ
     last_daily_date = None  # date on which the previous day was already reported
 
@@ -70,8 +80,8 @@ def mark_order_activity():
         state.sleep_start_time = None
         state.panic_events = 0
         state.has_activity_since_sleep = False
-        log("🔄 ACTIVITY DETECTED - OKXSTOPI RESUMED (woke from sleep)")
-        asyncio.create_task(tg("🟢 OKXSTOPI RESUMED\n\nActivity detected - Watchdog is active again!"))
+        log("ACTIVITY DETECTED - OKXSTOPI RESUMED (woke from sleep)")
+        asyncio.create_task(tg("OKXSTOPI RESUMED\n\nActivity detected - Watchdog is active again!"))
     log("Order activity detected")
 
 def ts():
@@ -133,7 +143,7 @@ async def tg(msg, force=False):
         and "RESUMED" not in msg
         and "STARTED" not in msg
     ):
-        log(f"💤 Telegram notification suppressed (sleeping mode): {msg[:50]}...")
+        log(f"Telegram notification suppressed (sleeping mode): {msg[:50]}...")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -163,17 +173,71 @@ async def get_pending_orders():
     data = await okx_request("GET", "/api/v5/trade/orders-pending")
     return data.get("data", [])
 
-async def get_orders_history(before_ms=None):
-    """Get recent order history to detect activity"""
-    params = {
-        "instType": "SWAP",
-        "limit": 50
-    }
-    if before_ms:
-        params["before"] = before_ms
-    
-    data = await okx_request("GET", "/api/v5/trade/orders-history", params=params)
-    return data.get("data", [])
+async def get_orders_history(inst_type="SWAP"):
+    """Recent filled and cancelled orders, newest first."""
+    data = await okx_request(
+        "GET",
+        "/api/v5/trade/orders-history",
+        params={"instType": inst_type, "limit": 100},
+    )
+    if not isinstance(data, dict) or str(data.get("code") or "0") != "0":
+        log(f"orders-history {inst_type} error: {data}")
+        return None
+    return data.get("data") or []
+
+def mark_order_seen(ord_id):
+    ord_id = str(ord_id or "")
+    if not ord_id or ord_id in state.seen_lookup:
+        return False
+    state.seen_lookup.add(ord_id)
+    state.seen_order_ids.append(ord_id)
+    if len(state.seen_order_ids) > 2000:
+        dropped = state.seen_order_ids.pop(0)
+        state.seen_lookup.discard(dropped)
+    return True
+
+def is_closed_order(order):
+    """Filled close. Opening orders on OKX carry pnl 0 and reduceOnly false."""
+    if str(order.get("state") or "") != "filled":
+        return False
+    if str(order.get("reduceOnly") or "").lower() == "true":
+        return True
+    return fnum(order.get("pnl")) != 0.0
+
+def fmt_tokens(value):
+    text = f"{value:.8f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+def fmt_result(value):
+    """Exchange pnl as +10$ or -2$."""
+    number = round(float(value), 2)
+    if abs(number - round(number)) < 0.001:
+        body = f"{number:.0f}"
+    else:
+        body = f"{number:.2f}".rstrip("0").rstrip(".")
+    if number > 0:
+        return f"+{body}$"
+    return f"{body}$"
+
+def extra_trade_alert(result):
+    if result > PROFIT_ALERT_USD:
+        return ROCKET_ALERT
+    if result < -LOSS_ALERT_USD:
+        return CLOWN_ALERT
+    return None
+
+async def order_size(order):
+    """Contracts from order history, expressed as tokens and USDT notional."""
+    filled = fnum(order.get("accFillSz")) or fnum(order.get("sz"))
+    price = fnum(order.get("avgPx")) or fnum(order.get("px"))
+    spec = await get_inst_spec(order.get("instId"))
+    if spec.get("ctType") == "inverse":
+        usdt = filled * spec["ctVal"]
+        tokens = usdt / price if price else 0.0
+    else:
+        tokens = filled * spec["ctVal"]
+        usdt = tokens * price
+    return usdt, tokens
 
 async def get_positions():
     data = await okx_request("GET", "/api/v5/account/positions")
@@ -258,6 +322,9 @@ def position_snapshot(row):
         "realizedPnl": str(row.get("realizedPnl") or "0"),
         "pnl": str(row.get("pnl") or "0"),
         "pnlRatio": str(row.get("pnlRatio") or "0"),
+        "fee": str(row.get("fee") or "0"),
+        "fundingFee": str(row.get("fundingFee") or "0"),
+        "liqPenalty": str(row.get("liqPenalty") or "0"),
         "type": str(row.get("type") or ""),
     }
 
@@ -348,6 +415,16 @@ def pnl_to_usd(amount, spec, price):
         return amount * price, "USDT"
     return amount, ccy
 
+def position_fees(source):
+    """Exchange fee columns are cumulative and already signed (a charge is negative)."""
+    if not source:
+        return 0.0
+    return (
+        fnum(source.get("fee"))
+        + fnum(source.get("fundingFee"))
+        + fnum(source.get("liqPenalty"))
+    )
+
 async def describe_closed_trade(row, prev):
     """
     One closed-trade block.
@@ -364,11 +441,15 @@ async def describe_closed_trade(row, prev):
     new_realized = fnum(row.get("realizedPnl"))
     old_realized = fnum(prev["realizedPnl"]) if prev else 0.0
     delta_realized = new_realized - old_realized
+    delta_gross = fnum(row.get("pnl")) - (fnum(prev.get("pnl")) if prev else 0.0)
+    delta_fee = position_fees(row) - (position_fees(prev) if prev else 0.0)
 
     spec = await get_inst_spec(row.get("instId"))
     price = fnum(row.get("closeAvgPx")) or fnum(row.get("openAvgPx"))
     notional = contract_notional_usd(spec, delta_sz, price)
     pnl_usd, pnl_ccy = pnl_to_usd(delta_realized, spec, price)
+    gross_usd, _ = pnl_to_usd(delta_gross, spec, price)
+    fee_usd, _ = pnl_to_usd(delta_fee, spec, price)
 
     lever = fnum(row.get("lever"))
     if lever > 0 and notional > 0:
@@ -400,6 +481,8 @@ async def describe_closed_trade(row, prev):
         "label": label,
         "notional": notional,
         "pnl": pnl_usd,
+        "gross": gross_usd,
+        "fee": fee_usd,
         "ccy": pnl_ccy,
         "ratio": ratio,
         "margin": margin if margin > 0 else 0.0,
@@ -457,6 +540,15 @@ def load_trade_state():
     if isinstance(last_daily, str):
         state.last_daily_date = last_daily
 
+    if payload.get("day_open_balance") is not None:
+        state.day_open_balance = fnum(payload.get("day_open_balance"))
+
+    ids = payload.get("seen_order_ids") or []
+    if isinstance(ids, list):
+        state.seen_order_ids = [str(item) for item in ids][-2000:]
+        state.seen_lookup = set(state.seen_order_ids)
+        state.order_history_ready = bool(state.seen_order_ids)
+
     log(
         f"Loaded {len(state.trade_events)} closed trades "
         f"and {len(state.position_snapshots)} position cursors"
@@ -486,6 +578,8 @@ def save_trade_state():
             state.next_report_at.isoformat() if state.next_report_at else None
         ),
         "last_daily_date": state.last_daily_date,
+        "day_open_balance": state.day_open_balance,
+        "seen_order_ids": state.seen_order_ids[-2000:],
     }
     tmp = TRADE_LOG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -511,57 +605,47 @@ def events_between(start_dt, end_dt):
     found.sort(key=lambda event: int(fnum(event.get("ts"))))
     return found
 
-def trade_totals(events):
-    notional = sum(fnum(event.get("notional")) for event in events)
-    pnl = sum(fnum(event.get("pnl")) for event in events)
-    weight = 0.0
-    weighted = 0.0
-    for event in events:
-        margin = fnum(event.get("margin"))
-        if margin > 0:
-            weight += margin
-            weighted += fnum(event.get("ratio")) * margin
-    ratio = (weighted / weight) if weight else None
-    return len(events), notional, pnl, ratio
+def event_volume(event):
+    if "usdt" in event:
+        return fnum(event.get("usdt"))
+    return fnum(event.get("notional"))
 
-def render_report_pages(title, start_dt, end_dt, events, extra_lines, balance):
-    """One or more Telegram messages. Balance is only on the last page."""
+def event_result(event):
+    if "result" in event:
+        return fnum(event.get("result"))
+    return fnum(event.get("pnl"))
+
+def report_status():
+    idle = int(time.time() - state.last_order_activity)
+    if state.is_sleeping:
+        return "SLEEPING", idle
+    if idle < WATCHDOG_TIMEOUT:
+        return "OK", idle
+    return "WARNING", idle
+
+def render_summary_report(
+    title, start_dt, end_dt, events, balance, balance_change,
+    unrealized, orders, positions,
+):
     period = f"{fmt_utc(start_dt.timestamp())} — {fmt_utc(end_dt.timestamp())}"
-    count, notional, pnl, ratio = trade_totals(events)
-    pnl_line = f"PnL: {fmt_pnl(pnl)} USDT"
-    if ratio is not None:
-        pnl_line += f" ({fmt_pct(ratio)})"
-    totals = (
-        f"Trades: {count}\n"
-        f"Amount: {notional:.2f} USDT\n"
-        f"{pnl_line}"
+    volume = sum(event_volume(event) for event in events)
+    result = sum(event_result(event) for event in events)
+    status, idle = report_status()
+    return (
+        f"{title}\n\n"
+        f"Period: {period}\n\n"
+        f"Trades: {len(events)}\n"
+        f"Volume: {volume:.2f} USDT\n"
+        f"Result: {fmt_result(result)}\n"
+        f"Balance change: {fmt_pnl(balance_change)} USDT\n\n"
+        f"Balance: {balance:.2f} USDT\n"
+        f"Unrealized PnL: {fmt_pnl(unrealized)} USDT\n"
+        f"Open orders: {orders}\n"
+        f"Open positions: {positions}\n\n"
+        f"Status: {status}\n"
+        f"Last order activity: {idle}s ago\n"
+        f"Panic events: {state.panic_events}/{PANIC_THRESHOLD}"
     )
-    header = f"{title}\n\nPeriod: {period}\n\n"
-    tail_parts = [totals]
-    if extra_lines:
-        tail_parts.append("\n".join(extra_lines))
-    tail_parts.append(f"💰 Balance: {balance:.2f} USDT")
-    tail = "\n\n" + "\n\n".join(tail_parts)
-
-    blocks = [format_trade_block(event) for event in events]
-    if not blocks:
-        return [header + "\n\n".join(tail_parts)]
-
-    pages = []
-    current = header
-    limit = 3500
-    for block in blocks:
-        piece = block + "\n\n"
-        if len(current) + len(piece) + len(tail) > limit and current != header:
-            pages.append(current.rstrip())
-            current = f"{title} (continued)\n\n"
-        current += piece
-    pages.append(current.rstrip() + tail)
-
-    if len(pages) > 1:
-        total = len(pages)
-        pages = [f"{page}\n\n({index}/{total})" for index, page in enumerate(pages, 1)]
-    return pages
 
 async def check_closed_trades():
     """
@@ -619,7 +703,6 @@ async def check_closed_trades():
     if not pending:
         return
 
-    blocks = []
     recorded = []
     applied = []
     terminal_alive = False
@@ -631,7 +714,6 @@ async def check_closed_trades():
             continue
         applied.append((pos_id, snap))
         if trade:
-            blocks.append(format_trade_block(trade))
             recorded.append(trade)
             # Partial/full closes mean the terminal is trading.
             # Liquidation and ADL must not reset the freeze timer.
@@ -643,7 +725,7 @@ async def check_closed_trades():
 
     remember_trades(recorded)
 
-    if not blocks:
+    if not recorded:
         return
 
     if terminal_alive:
@@ -653,12 +735,17 @@ async def check_closed_trades():
             state.last_order_activity = time.time()
 
     bal = await get_balance()
-    title = "📈 TRADE CLOSED" if len(blocks) == 1 else f"📈 TRADES CLOSED ({len(blocks)})"
+    if len(recorded) == 1:
+        blocks = [format_trade_block(recorded[0])]
+        title = "TRADE CLOSED"
+    else:
+        blocks = [format_trade_block(trade) for trade in recorded]
+        title = f"TRADES CLOSED ({len(recorded)})"
     body = "\n\n".join(blocks)
     await tg(
         f"{title}\n\n"
         f"{body}\n\n"
-        f"💰 Balance: {bal:.2f} USDT",
+        f"Balance: {bal:.2f} USDT",
         force=True,
     )
     log(f"Reported {len(blocks)} closed trade(s), balance {bal:.2f} USDT")
@@ -732,7 +819,7 @@ async def enter_sleep_mode():
     state.has_activity_since_sleep = False
     
     sleep_msg = (
-        f"💤 OKXSTOPI ENTERING SLEEP MODE\n\n"
+        f"OKXSTOPI ENTERING SLEEP MODE\n\n"
         f"Panic events: {state.panic_events} (threshold: {PANIC_THRESHOLD})\n"
         f"Watchdog is now sleeping until new trading activity is detected.\n"
         f"No more panic notifications will be sent.\n\n"
@@ -740,7 +827,7 @@ async def enter_sleep_mode():
     )
     
     await tg(sleep_msg)
-    log("💤 OKXSTOPI entering sleep mode - no more panic notifications")
+    log("OKXSTOPI entering sleep mode - no more panic notifications")
 
 async def panic(reason):
     state.panic_events += 1
@@ -758,7 +845,7 @@ async def panic(reason):
     remaining = PANIC_THRESHOLD - state.panic_events
 
     await tg(
-        f"🚨 OKXSTOPI PANIC #{state.panic_events}\n\n"
+        f"OKXSTOPI PANIC #{state.panic_events}\n\n"
         f"{reason}\n\n"
         f"Orders cancelled: {cancelled}\n"
         f"Positions closed: {closed}\n"
@@ -777,18 +864,19 @@ async def startup_report():
 
     state.last_report_time = time.time()
     state.last_report_balance = bal
+    if state.day_open_balance is None:
+        state.day_open_balance = bal
     state.last_hour_reported = get_current_hour()
     state.last_orders_count = orders
 
     await tg(
-        f"🟢 OKXSTOPI STARTED\n\n"
+        f"OKXSTOPI STARTED\n\n"
         f"Balance: {bal:.2f} USDT\n"
         f"Orders: {orders}\n"
         f"Positions: {pos}\n"
-        f"Timeout: {WATCHDOG_TIMEOUT}s\n"
+        f"Stuck order timeout: {WATCHDOG_TIMEOUT}s\n"
         f"Check interval: {CHECK_INTERVAL}s\n"
-        f"Trade alerts: on close, hourly, and daily\n"
-        f"Panic threshold: {PANIC_THRESHOLD} (sleep mode after)"
+        f"Trade alerts: order history every {CHECK_INTERVAL}s"
     )
 
 def upcoming_hour(moment):
@@ -797,45 +885,34 @@ def upcoming_hour(moment):
         boundary += timedelta(hours=1)
     return boundary
 
-async def watchdog_lines():
-    idle = int(time.time() - state.last_order_activity)
-    if state.is_sleeping:
-        status = "💤 SLEEPING"
-    elif idle < WATCHDOG_TIMEOUT:
-        status = "✅ OK"
-    else:
-        status = "⚠️ WARNING"
-
-    try:
-        orders = len(await get_pending_orders())
-        positions = len(await get_positions())
-    except Exception as e:
-        log(f"Status lines failed: {e}")
-        orders = 0
-        positions = 0
-
-    return [
-        f"Status: {status}",
-        f"Last order activity: {idle}s ago",
-        f"Open orders: {orders}",
-        f"Open positions: {positions}",
-        f"Panic events: {state.panic_events}/{PANIC_THRESHOLD}",
-    ]
-
-async def publish_report(title, start_dt, end_dt, extra_lines):
+async def publish_report(title, start_dt, end_dt, balance_basis):
     events = events_between(start_dt, end_dt)
     balance = await get_balance()
+    try:
+        positions = await get_positions()
+        orders = len(await get_pending_orders())
+    except Exception as e:
+        log(f"Report account snapshot failed: {e}")
+        positions = []
+        orders = 0
+    unrealized = sum(fnum(pos.get("upl")) for pos in positions)
+    if balance_basis == "day":
+        basis = state.day_open_balance
+    else:
+        basis = state.last_report_balance
+    if basis is None:
+        basis = balance
+    balance_change = balance - basis
     state.last_report_time = time.time()
     state.last_report_balance = balance
-    pages = render_report_pages(
-        title, start_dt, end_dt, events, extra_lines, balance
+    if balance_basis == "day":
+        state.day_open_balance = balance
+    text = render_summary_report(
+        title, start_dt, end_dt, events, balance, balance_change,
+        unrealized, orders, len(positions),
     )
-    for page in pages:
-        await tg(page, force=True)
-    log(
-        f"{title}: {len(events)} trade(s), "
-        f"{len(pages)} message(s), balance {balance:.2f} USDT"
-    )
+    await tg(text, force=True)
+    log(f"{title}: {len(events)} trade(s), balance {balance:.2f} USDT")
 
 async def flush_due_reports():
     """Send every clock hour that is already due, and the daily report at midnight."""
@@ -850,20 +927,20 @@ async def flush_due_reports():
             # The hour that just finished is always sent.
             if hour_events or not late:
                 await publish_report(
-                    "📊 OKXSTOPI HOURLY REPORT",
+                    "OKXSTOPI HOURLY REPORT",
                     period_start,
                     period_end,
-                    await watchdog_lines(),
+                    "hour",
                 )
 
             if period_end.hour == 0:
                 day_key = period_end.date().isoformat()
                 if state.last_daily_date != day_key:
                     await publish_report(
-                        "📆 OKXSTOPI DAILY REPORT",
+                        "OKXSTOPI DAILY REPORT",
                         period_end - timedelta(days=1),
                         period_end,
-                        [],
+                        "day",
                     )
                     state.last_daily_date = day_key
         except Exception as e:
@@ -924,55 +1001,145 @@ async def check_order_activity():
         log(f"Error checking order activity: {e}")
         return False
 
-async def watchdog():
-    """Main watchdog loop"""
-    while True:
-        now = time.time()
+async def cancel_stuck_orders():
+    """Cancel only orders whose own exchange update time is older than the timeout."""
+    orders = await get_pending_orders()
+    if not isinstance(orders, list):
+        return
 
-        try:
-            await check_closed_trades()
-        except Exception as e:
-            log(f"Closed trades check error: {e}")
-
-        # Skip panic checks during startup grace period
-        if now - state.started_at < STARTUP_GRACE:
-            await asyncio.sleep(CHECK_INTERVAL)
+    now = time.time()
+    newest = None
+    stuck = []
+    for order in orders:
+        ord_id = str(order.get("ordId") or "")
+        updated = fnum(order.get("uTime")) / 1000.0
+        if not ord_id or updated <= 0:
             continue
+        if newest is None or updated > newest:
+            newest = updated
+        if now - updated < WATCHDOG_TIMEOUT:
+            state.cancel_attempted.discard(ord_id)
+            continue
+        if ord_id in state.cancel_attempted:
+            continue
+        stuck.append(order)
 
-        # Если бот в спящем режиме - проверяем только активность, не паникуем
-        if state.is_sleeping:
-            try:
-                # Проверяем активность без паники
-                await check_order_activity()
-                
-                # Дополнительная проверка: есть ли открытые позиции или ордера?
-                orders = await get_pending_orders()
-                positions = await get_positions()
-                
-                # Если есть активность и бот в сне - пробуждаемся через mark_order_activity
-                if orders or positions:
-                    # Проверяем, не появились ли ордера недавно
-                    await check_order_activity()
-                
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
-            except Exception as e:
-                log(f"Error in sleep mode check: {e}")
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
+    if newest is not None:
+        state.last_order_activity = newest
 
-        # Check for order activity
+    if not stuck:
+        return
+
+    cancelled = []
+    for order in stuck:
+        ord_id = str(order.get("ordId") or "")
+        result = await okx_request(
+            "POST",
+            "/api/v5/trade/cancel-order",
+            {"instId": order.get("instId"), "ordId": ord_id},
+        )
+        if isinstance(result, dict) and result.get("code") == "0":
+            state.cancel_attempted.add(ord_id)
+            cancelled.append(order)
+            idle = int(now - fnum(order.get("uTime")) / 1000.0)
+            log(f"Cancelled stuck order {ord_id} {order.get('instId')} idle {idle}s")
+        else:
+            log(f"Failed to cancel stuck order {ord_id}: {result}")
+
+    if not cancelled:
+        return
+
+    lines = ["STUCK ORDERS CANCELLED", ""]
+    for order in cancelled:
+        idle = int(now - fnum(order.get("uTime")) / 1000.0)
+        lines.append(
+            f"{order.get('instId')} {order.get('ordId')}\n"
+            f"No movement for {idle}s"
+        )
+    await tg("\n\n".join(lines), force=True)
+
+async def report_filled_orders():
+    """Read closed orders from exchange history. Do not derive PnL or percent."""
+    rows = []
+    for inst_type in ("SWAP", "FUTURES"):
+        batch = await get_orders_history(inst_type)
+        if batch is None:
+            return
+        rows.extend(batch)
+
+    if not state.order_history_ready:
+        for order in rows:
+            mark_order_seen(order.get("ordId"))
+        state.order_history_ready = True
+        log(f"Order history baseline: {len(state.seen_order_ids)} orders")
         try:
-            await check_order_activity()
+            save_trade_state()
         except Exception as e:
-            log(f"Check order activity error: {e}")
+            log(f"Failed to save order history baseline: {e}")
+        return
 
-        # Check if timeout exceeded
-        if now - state.last_order_activity > WATCHDOG_TIMEOUT:
-            await panic(
-                f"No order activity for {WATCHDOG_TIMEOUT}s\n"
-                f"Last activity: {fmt_utc(state.last_order_activity)}"
-            )
+    fresh = []
+    changed = False
+    for order in rows:
+        if not mark_order_seen(order.get("ordId")):
+            continue
+        changed = True
+        if is_closed_order(order):
+            fresh.append(order)
+
+    if not fresh:
+        if changed:
+            try:
+                save_trade_state()
+            except Exception as e:
+                log(f"Failed to save seen orders: {e}")
+        return
+
+    fresh.sort(key=lambda order: fnum(order.get("uTime")))
+    balance = await get_balance()
+    recorded = []
+    for order in fresh:
+        try:
+            usdt, tokens = await order_size(order)
+        except Exception as e:
+            log(f"Failed to read order size {order.get('ordId')}: {e}")
+            continue
+        result = fnum(order.get("pnl"))
+        await tg(
+            f"TRADE CLOSED\n\n"
+            f"{order.get('instId')}\n"
+            f"Amount: {usdt:.2f} USDT\n"
+            f"Tokens: {fmt_tokens(tokens)}\n"
+            f"Result: {fmt_result(result)}\n\n"
+            f"Balance: {balance:.2f} USDT",
+            force=True,
+        )
+        alert = extra_trade_alert(result)
+        if alert:
+            await tg(alert, force=True)
+        recorded.append({
+            "ts": int(fnum(order.get("uTime")) or time.time() * 1000),
+            "instId": order.get("instId") or "",
+            "usdt": usdt,
+            "result": result,
+            "ordId": str(order.get("ordId") or ""),
+        })
+        log(f"Closed order {order.get('ordId')} {order.get('instId')} {fmt_result(result)}")
+
+    remember_trades(recorded)
+
+async def watchdog():
+    """Check stuck orders and order history on the same interval."""
+    while True:
+        try:
+            await cancel_stuck_orders()
+        except Exception as e:
+            log(f"Stuck order check error: {e}")
+
+        try:
+            await report_filled_orders()
+        except Exception as e:
+            log(f"Order history check error: {e}")
 
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -983,7 +1150,7 @@ async def ping_service():
         if state.panic_events == 0 and not state.is_sleeping:
             idle = int(time.time() - state.last_order_activity)
             if idle > WATCHDOG_TIMEOUT - 30:  # Warning when close to timeout
-                log(f"⚠️ Warning: {idle}s since last order activity")
+                log(f"Warning: {idle}s since last order activity")
         
         # Log current status every 5 minutes
         if int(time.time() / 300) != int((time.time() - 60) / 300):
@@ -1010,7 +1177,7 @@ async def main():
         bal = await get_balance()
         log(f"Balance check successful: {bal:.2f} USDT")
     except Exception as e:
-        log(f"⚠️ Warning: Could not fetch balance: {e}")
+        log(f"Warning: Could not fetch balance: {e}")
 
     await startup_report()
     log(

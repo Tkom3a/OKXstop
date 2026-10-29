@@ -22,45 +22,43 @@ Panic threshold: 3 (sleep mode after)
   
 ---  
   
-📊 OKXSTOPI HOURLY REPORT  
+OKXSTOPI HOURLY REPORT  
   
-Period: 2026-06-18 18:00 UTC — 2026-06-18 19:00 UTC  
+Period: 2026-10-12 11:00 UTC — 2026-10-12 12:00 UTC  
   
-BTC-USDT-SWAP LONG  
-Amount: 1250.40 USDT  
-PnL: +12.35 USDT (+9.88%)  
+Trades: 13  
+Volume: 20.35 USDT  
+Result: +10$  
+Balance change: +0.05 USDT  
   
-Trades: 1  
-Amount: 1250.40 USDT  
-PnL: +12.35 USDT (+9.88%)  
-  
-Status: ✅ OK  
-Last order activity: 12s ago  
-Open orders: 96  
+Balance: 939.64 USDT  
+Unrealized PnL: +0.00 USDT  
+Open orders: 100  
 Open positions: 0  
-Panic events: 0/3  
   
-💰 Balance: 5012.40 USDT  
+Status: OK  
+Last order activity: 5s ago  
+Panic events: 0/3  
   
 ---  
   
-📆 OKXSTOPI DAILY REPORT  
+OKXSTOPI DAILY REPORT  
   
-Period: 2026-06-18 00:00 UTC — 2026-06-19 00:00 UTC  
+Period: 2026-10-12 00:00 UTC — 2026-10-13 00:00 UTC  
   
-BTC-USDT-SWAP LONG  
-Amount: 1250.40 USDT  
-PnL: +12.35 USDT (+9.88%)  
+Trades: 40  
+Volume: 180.00 USDT  
+Result: +18$  
+Balance change: +1.05 USDT  
   
-ETH-USDT-SWAP SHORT  
-Amount: 400.00 USDT  
-PnL: -1.20 USDT (-3.00%)  
+Balance: 940.69 USDT  
+Unrealized PnL: +0.00 USDT  
+Open orders: 100  
+Open positions: 0  
   
-Trades: 2  
-Amount: 1650.40 USDT  
-PnL: +11.15 USDT (+6.20%)  
-  
-💰 Balance: 5012.40 USDT  
+Status: OK  
+Last order activity: 5s ago  
+Panic events: 0/3  
   
 ---  
   
@@ -92,27 +90,33 @@ Activity detected - Watchdog is active again!
   
 ---  
   
-📈 TRADE CLOSED  
+TRADE CLOSED  
   
-BTC-USDT-SWAP LONG  
-Amount: 1250.40 USDT  
-PnL: +12.35 USDT (+9.88%)  
+BTC-USDT-SWAP  
+Amount: 125.40 USDT  
+Tokens: 0.0021  
+Result: +10$  
   
-💰 Balance: 5012.40 USDT  
+Balance: 939.64 USDT  
   
 ---  
   
-📈 TRADES CLOSED (2)  
+🚀  
   
-BTC-USDT-SWAP LONG  
-Amount: 1250.40 USDT  
-PnL: +12.35 USDT (+9.88%)  
+---  
   
-ETH-USDT-SWAP SHORT (partial)  
-Amount: 400.00 USDT  
-PnL: -1.20 USDT (-3.00%)  
+TRADE CLOSED  
   
-💰 Balance: 5012.40 USDT  
+ETH-USDT-SWAP  
+Amount: 80.00 USDT  
+Tokens: 0.03  
+Result: -16$  
+  
+Balance: 923.64 USDT  
+  
+---  
+  
+🤡  
   
 ---  
   
