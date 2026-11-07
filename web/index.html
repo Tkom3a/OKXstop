@@ -71,12 +71,32 @@
   .empty { color: var(--muted); margin: 0; }
   #msg { color: var(--muted); min-height: 1.2em; }
   .stamp { margin-left: auto; color: var(--muted); font-size: 13px; }
+  .head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  #login { max-width: 420px; }
+  #login-msg { color: var(--red-ink); }
 </style>
 </head>
 <body>
 <main>
-  <h1>OKXSTOP</h1>
-  <p class="note">Настройки применяются со следующей проверки. Страница без пароля — не публикуйте порт в интернет.</p>
+  <div class="head">
+    <h1>OKXSTOP</h1>
+    <button id="logout" class="ghost" type="button" hidden>Выйти</button>
+  </div>
+
+  <section id="login">
+    <h2>Вход</h2>
+    <form id="login-form">
+      <label for="password">Пароль</label>
+      <input id="password" type="password" autocomplete="current-password" required>
+      <div class="row">
+        <button type="submit">Войти</button>
+        <span id="login-msg"></span>
+      </div>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+  <p class="note">Настройки применяются со следующей проверки.</p>
 
   <section>
     <h2>Настройки</h2>
@@ -124,6 +144,7 @@
     <h2>Временный чёрный список</h2>
     <div id="bans"></div>
   </section>
+  </div>
 </main>
 <script>
 const fields = [
@@ -131,8 +152,43 @@ const fields = [
   "loss_alert_usd", "pair_loss_usd", "pair_ban_hours"
 ];
 let dirty = false;
+let timer = null;
 const form = document.getElementById("settings");
+const loginBox = document.getElementById("login");
+const app = document.getElementById("app");
+const logoutButton = document.getElementById("logout");
 form.addEventListener("input", () => { dirty = true; });
+
+function showLogin(message) {
+  app.hidden = true;
+  loginBox.hidden = false;
+  logoutButton.hidden = true;
+  document.getElementById("login-msg").textContent = message || "";
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+}
+
+function showApp() {
+  loginBox.hidden = true;
+  app.hidden = false;
+  logoutButton.hidden = false;
+  if (!timer) timer = setInterval(load, 5000);
+}
+
+async function guard(res) {
+  if (res.status === 401) {
+    showLogin("");
+    return null;
+  }
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 503) {
+    showLogin(data.error || "Вход не настроен");
+    return null;
+  }
+  return data;
+}
 
 function esc(value) {
   return String(value).replace(/[&<>"']/g, (ch) => ({
@@ -200,11 +256,38 @@ function render(data) {
 async function load() {
   try {
     const res = await fetch("/api/state");
-    render(await res.json());
+    const data = await guard(res);
+    if (!data || !res.ok) return;
+    showApp();
+    render(data);
   } catch (err) {
-    document.getElementById("msg").textContent = "Нет связи с сервисом";
+    const target = app.hidden ? "login-msg" : "msg";
+    document.getElementById(target).textContent = "Нет связи с сервисом";
   }
 }
+
+document.getElementById("login-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const res = await fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password: document.getElementById("password").value })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    document.getElementById("login-msg").textContent = data.error || "Ошибка";
+    return;
+  }
+  document.getElementById("password").value = "";
+  document.getElementById("login-msg").textContent = "";
+  load();
+});
+
+logoutButton.addEventListener("click", async () => {
+  await fetch("/api/logout", { method: "POST" });
+  dirty = false;
+  showLogin("");
+});
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -215,7 +298,8 @@ form.addEventListener("submit", async (event) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
-  const data = await res.json();
+  const data = await guard(res);
+  if (!data) return;
   document.getElementById("msg").textContent = res.ok ? "Сохранено" : (data.error || "Ошибка");
   if (res.ok) {
     dirty = false;
@@ -227,16 +311,15 @@ document.getElementById("bans").addEventListener("click", async (event) => {
   const inst = event.target.getAttribute("data-unban");
   if (!inst) return;
   event.target.disabled = true;
-  await fetch("/api/unban", {
+  const res = await fetch("/api/unban", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ instId: inst })
   });
-  load();
+  if (await guard(res)) load();
 });
 
 load();
-setInterval(load, 5000);
 </script>
 </body>
 </html>

@@ -12,6 +12,7 @@ import json
 import hmac
 import base64
 import hashlib
+import secrets
 import asyncio
 import aiohttp
 import aiohttp.web
@@ -33,6 +34,14 @@ LOSS_ALERT_USD = float(os.getenv("LOSS_ALERT_USD", "15"))
 PAIR_LOSS_USD = float(os.getenv("PAIR_LOSS_USD", "20"))
 PAIR_BAN_HOURS = float(os.getenv("PAIR_BAN_HOURS", "12"))
 WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
+WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
+WEB_COOKIE_SECURE = os.getenv("WEB_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes")
+SESSION_COOKIE = "okxstop_session"
+SESSION_TTL = 7 * 24 * 3600
+LOGIN_LIMIT = 8
+LOGIN_LOCK_SECONDS = 15 * 60
+_session_key = secrets.token_bytes(32)
+_login_failures = {}
 # Sent alone so Telegram shows them large.
 ROCKET_ALERT = "🚀"
 CLOWN_ALERT = "🤡"
@@ -1418,6 +1427,106 @@ def blacklist_rows():
     rows.sort(key=lambda row: row["until"])
     return rows
 
+def issue_session():
+    expires = int(time.time()) + SESSION_TTL
+    payload = f"{expires}.{secrets.token_hex(16)}".encode()
+    signature = hmac.new(_session_key, payload, hashlib.sha256).hexdigest()
+    return payload.decode() + "." + signature
+
+def session_valid(token):
+    if not isinstance(token, str):
+        return False
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    expires, nonce, signature = parts
+    if not expires.isdigit() or not nonce:
+        return False
+    payload = f"{expires}.{nonce}".encode()
+    expected = hmac.new(_session_key, payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return False
+    return int(expires) > time.time()
+
+def password_matches(given):
+    if not WEB_PASSWORD or not isinstance(given, str) or not given or len(given) > 200:
+        return False
+    return hmac.compare_digest(given.encode("utf-8"), WEB_PASSWORD.encode("utf-8"))
+
+def login_locked(ip, now=None):
+    now = now or time.time()
+    recent = [stamp for stamp in _login_failures.get(ip, []) if now - stamp < LOGIN_LOCK_SECONDS]
+    if recent:
+        _login_failures[ip] = recent
+    else:
+        _login_failures.pop(ip, None)
+    return len(recent) >= LOGIN_LIMIT
+
+def record_login_failure(ip):
+    now = time.time()
+    recent = [stamp for stamp in _login_failures.get(ip, []) if now - stamp < LOGIN_LOCK_SECONDS]
+    recent.append(now)
+    _login_failures[ip] = recent
+
+def clear_login_failures(ip):
+    _login_failures.pop(ip, None)
+
+def set_session_cookie(response):
+    response.set_cookie(
+        SESSION_COOKIE,
+        issue_session(),
+        max_age=SESSION_TTL,
+        httponly=True,
+        samesite="Lax",
+        secure=WEB_COOKIE_SECURE,
+        path="/",
+    )
+    return response
+
+@aiohttp.web.middleware
+async def web_auth(request, handler):
+    if request.path in ("/", "/api/login"):
+        return await handler(request)
+    if not WEB_PASSWORD:
+        return aiohttp.web.json_response(
+            {"error": "Задайте WEB_PASSWORD в .env и перезапустите сервис"},
+            status=503,
+        )
+    if request.path == "/api/logout" or session_valid(request.cookies.get(SESSION_COOKIE, "")):
+        return await handler(request)
+    return aiohttp.web.json_response({"error": "Нужен вход"}, status=401)
+
+async def handle_login(request):
+    ip = request.remote or "?"
+    if login_locked(ip):
+        return aiohttp.web.json_response(
+            {"error": "Слишком много попыток. Подождите 15 минут."},
+            status=429,
+        )
+    try:
+        raw = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({"error": "bad json"}, status=400)
+    if not isinstance(raw, dict):
+        return aiohttp.web.json_response({"error": "bad json"}, status=400)
+    if not WEB_PASSWORD:
+        return aiohttp.web.json_response(
+            {"error": "Задайте WEB_PASSWORD в .env и перезапустите сервис"},
+            status=503,
+        )
+    if not password_matches(raw.get("password")):
+        record_login_failure(ip)
+        log(f"Web login failed from {ip}")
+        return aiohttp.web.json_response({"error": "Неверный пароль"}, status=401)
+    clear_login_failures(ip)
+    log(f"Web login from {ip}")
+    return set_session_cookie(aiohttp.web.json_response({"ok": True}))
+
+async def handle_logout(_request):
+    response = aiohttp.web.json_response({"ok": True})
+    response.del_cookie(SESSION_COOKIE, path="/")
+    return response
+
 async def handle_index(_request):
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")
     if not os.path.isfile(path):
@@ -1463,8 +1572,10 @@ async def handle_unban(request):
     return aiohttp.web.json_response({"blacklist": blacklist_rows()})
 
 async def start_web():
-    app = aiohttp.web.Application()
+    app = aiohttp.web.Application(middlewares=[web_auth])
     app.router.add_get("/", handle_index)
+    app.router.add_post("/api/login", handle_login)
+    app.router.add_post("/api/logout", handle_logout)
     app.router.add_get("/api/state", handle_state)
     app.router.add_post("/api/settings", handle_settings)
     app.router.add_post("/api/unban", handle_unban)
@@ -1472,7 +1583,10 @@ async def start_web():
     await runner.setup()
     site = aiohttp.web.TCPSite(runner, "0.0.0.0", WEB_PORT)
     await site.start()
-    log(f"Web UI on port {WEB_PORT}")
+    if WEB_PASSWORD:
+        log(f"Web UI on port {WEB_PORT}, password required")
+    else:
+        log(f"Web UI on port {WEB_PORT} is locked until WEB_PASSWORD is set")
 
 async def main():
     if not all([
