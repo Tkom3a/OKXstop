@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OKXSTOP</title>
+<style>
+  :root {
+    --bg: #101410;
+    --card: #1a211c;
+    --line: #2c3830;
+    --text: #e7eee4;
+    --muted: #8ea094;
+    --green: #1f9d57;
+    --green-ink: #d8ffe8;
+    --red: #d4534a;
+    --red-ink: #ffe4e1;
+    --field: #0e1410;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.45 "Segoe UI", "PT Sans", sans-serif;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 28px 18px 48px; }
+  h1 { font-size: 22px; font-weight: 650; margin: 0 0 4px; letter-spacing: 0.04em; }
+  h2 { font-size: 16px; margin: 0 0 12px; font-weight: 650; }
+  p.note { color: var(--muted); margin: 0 0 22px; }
+  section {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 14px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+  }
+  label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+  input {
+    width: 100%;
+    background: var(--field);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font: inherit;
+  }
+  .row { display: flex; gap: 10px; align-items: center; margin-top: 14px; }
+  button {
+    background: var(--green);
+    color: #fff;
+    border: 0;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .up { color: var(--green-ink); }
+  .down { color: var(--red-ink); }
+  .empty { color: var(--muted); margin: 0; }
+  #msg { color: var(--muted); min-height: 1.2em; }
+  .stamp { margin-left: auto; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>OKXSTOP</h1>
+  <p class="note">Настройки применяются со следующей проверки. Страница без пароля — не публикуйте порт в интернет.</p>
+
+  <section>
+    <h2>Настройки</h2>
+    <form id="settings">
+      <div class="grid">
+        <div>
+          <label for="watchdog_timeout">Таймаут зависшего ордера, секунды</label>
+          <input id="watchdog_timeout" name="watchdog_timeout" inputmode="numeric">
+        </div>
+        <div>
+          <label for="check_interval">Интервал проверки, секунды</label>
+          <input id="check_interval" name="check_interval" inputmode="numeric">
+        </div>
+        <div>
+          <label for="profit_alert_usd">Ракета, если профит больше, $</label>
+          <input id="profit_alert_usd" name="profit_alert_usd" inputmode="decimal">
+        </div>
+        <div>
+          <label for="loss_alert_usd">Клоун, если убыток больше, $</label>
+          <input id="loss_alert_usd" name="loss_alert_usd" inputmode="decimal">
+        </div>
+        <div>
+          <label for="pair_loss_usd">ЧС пары, если убыток за окно больше, $</label>
+          <input id="pair_loss_usd" name="pair_loss_usd" inputmode="decimal">
+        </div>
+        <div>
+          <label for="pair_ban_hours">Окно и срок ЧС, часы</label>
+          <input id="pair_ban_hours" name="pair_ban_hours" inputmode="decimal">
+        </div>
+      </div>
+      <div class="row">
+        <button type="submit">Сохранить</button>
+        <span id="msg"></span>
+        <span class="stamp" id="stamp"></span>
+      </div>
+    </form>
+  </section>
+
+  <section>
+    <h2>Результат по парам</h2>
+    <div id="pairs"></div>
+  </section>
+
+  <section>
+    <h2>Временный чёрный список</h2>
+    <div id="bans"></div>
+  </section>
+</main>
+<script>
+const fields = [
+  "watchdog_timeout", "check_interval", "profit_alert_usd",
+  "loss_alert_usd", "pair_loss_usd", "pair_ban_hours"
+];
+let dirty = false;
+const form = document.getElementById("settings");
+form.addEventListener("input", () => { dirty = true; });
+
+function esc(value) {
+  return String(value).replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[ch]));
+}
+function money(value) {
+  const n = Number(value) || 0;
+  const body = Math.abs(n).toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+  if (n > 0) return "+" + body + "$";
+  return (n < 0 ? "-" : "") + body + "$";
+}
+function cls(value) {
+  const n = Number(value) || 0;
+  if (n > 0) return "up";
+  if (n < 0) return "down";
+  return "";
+}
+function when(ts, zone) {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleString("ru-RU", { timeZone: zone || "UTC" });
+}
+function left(sec) {
+  sec = Math.max(0, Number(sec) || 0);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return h + " ч " + m + " мин";
+}
+function table(headers, rows) {
+  if (!rows.length) return '<p class="empty">Пока пусто</p>';
+  const head = "<tr>" + headers.map(h => "<th>" + h + "</th>").join("") + "</tr>";
+  return "<table><thead>" + head + "</thead><tbody>" + rows.join("") + "</tbody></table>";
+}
+
+function render(data) {
+  const hours = data.settings.pair_ban_hours;
+  document.getElementById("pairs").innerHTML = table(
+    ["Пара", "Сделки", "Объём", "За " + hours + " ч", "Всего в журнале"],
+    data.pairs.map(row =>
+      "<tr><td>" + esc(row.instId) + "</td>" +
+      "<td class='num'>" + row.trades + "</td>" +
+      "<td class='num'>" + Number(row.volume).toFixed(2) + "</td>" +
+      "<td class='num " + cls(row.result_window) + "'>" + money(row.result_window) + "</td>" +
+      "<td class='num " + cls(row.result) + "'>" + money(row.result) + "</td></tr>"
+    )
+  );
+  document.getElementById("bans").innerHTML = table(
+    ["Пара", "Убыток", "До", "Осталось", ""],
+    data.blacklist.map(row =>
+      "<tr><td>" + esc(row.instId) + "</td>" +
+      "<td class='num down'>" + money(row.loss) + "</td>" +
+      "<td>" + esc(when(row.until, data.timezone)) + "</td>" +
+      "<td>" + left(row.remaining_sec) + "</td>" +
+      "<td><button class='ghost' type='button' data-unban='" + esc(row.instId) + "'>Снять</button></td></tr>"
+    )
+  );
+  if (!dirty) {
+    fields.forEach(name => {
+      document.getElementById(name).value = data.settings[name];
+    });
+  }
+  document.getElementById("stamp").textContent = "обновлено " + new Date().toLocaleTimeString("ru-RU");
+}
+
+async function load() {
+  try {
+    const res = await fetch("/api/state");
+    render(await res.json());
+  } catch (err) {
+    document.getElementById("msg").textContent = "Нет связи с сервисом";
+  }
+}
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const body = {};
+  fields.forEach(name => { body[name] = document.getElementById(name).value; });
+  const res = await fetch("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  document.getElementById("msg").textContent = res.ok ? "Сохранено" : (data.error || "Ошибка");
+  if (res.ok) {
+    dirty = false;
+    load();
+  }
+});
+
+document.getElementById("bans").addEventListener("click", async (event) => {
+  const inst = event.target.getAttribute("data-unban");
+  if (!inst) return;
+  event.target.disabled = true;
+  await fetch("/api/unban", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ instId: inst })
+  });
+  load();
+});
+
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

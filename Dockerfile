@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY okxstopi.py .
+COPY web ./web
 RUN chmod +x okxstopi.py
 
 CMD ["python", "okxstopi.py"]

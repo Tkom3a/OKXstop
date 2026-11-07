@@ -14,6 +14,7 @@ import base64
 import hashlib
 import asyncio
 import aiohttp
+import aiohttp.web
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
@@ -29,9 +30,23 @@ WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT", "120"))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))  # How often to check orders
 PROFIT_ALERT_USD = float(os.getenv("PROFIT_ALERT_USD", "5"))
 LOSS_ALERT_USD = float(os.getenv("LOSS_ALERT_USD", "15"))
-# Sent alone so Telegram shows them large. No other emoji in the script.
+PAIR_LOSS_USD = float(os.getenv("PAIR_LOSS_USD", "20"))
+PAIR_BAN_HOURS = float(os.getenv("PAIR_BAN_HOURS", "12"))
+WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
+# Sent alone so Telegram shows them large.
 ROCKET_ALERT = "🚀"
 CLOWN_ALERT = "🤡"
+GREEN_CIRCLE = "🟢"
+RED_CIRCLE = "🔴"
+SETTINGS_PATH = os.getenv("SETTINGS_PATH", os.path.join("data", "settings.json"))
+DEFAULT_SETTINGS = {
+    "watchdog_timeout": WATCHDOG_TIMEOUT,
+    "check_interval": CHECK_INTERVAL,
+    "profit_alert_usd": PROFIT_ALERT_USD,
+    "loss_alert_usd": LOSS_ALERT_USD,
+    "pair_loss_usd": PAIR_LOSS_USD,
+    "pair_ban_hours": PAIR_BAN_HOURS,
+}
 STARTUP_GRACE = int(os.getenv("STARTUP_GRACE", "30"))
 REPORT_TZ = ZoneInfo(os.getenv("REPORT_TIMEZONE", "UTC"))
 PANIC_THRESHOLD = int(os.getenv("PANIC_THRESHOLD", "3"))  # Максимум паник до "сна"
@@ -59,6 +74,8 @@ class State:
     seen_lookup = set()
     order_history_ready = False
     cancel_attempted = set()
+    pair_bans = {}
+    settings = dict(DEFAULT_SETTINGS)
     next_report_at = None  # next clock-hour boundary in REPORT_TZ
     last_daily_date = None  # date on which the previous day was already reported
 
@@ -209,7 +226,7 @@ def fmt_tokens(value):
     return text or "0"
 
 def fmt_result(value):
-    """Exchange pnl as +10$ or -2$."""
+    """Net result as +10$ or -2$."""
     number = round(float(value), 2)
     if abs(number - round(number)) < 0.001:
         body = f"{number:.0f}"
@@ -219,12 +236,89 @@ def fmt_result(value):
         return f"+{body}$"
     return f"{body}$"
 
+def result_circle(value):
+    if value > 0:
+        return GREEN_CIRCLE
+    if value < 0:
+        return RED_CIRCLE
+    return ""
+
+def fmt_result_marked(value):
+    circle = result_circle(value)
+    text = fmt_result(value)
+    if circle:
+        return f"{circle} {text}"
+    return text
+
+def money_in_usdt(amount, ccy, price):
+    code = (ccy or "USDT").upper()
+    if code in ("USDT", "USD", "USDC", ""):
+        return amount
+    if price:
+        return amount * price
+    return 0.0
+
+def order_net_result(order):
+    """Close result after the order fee. OKX pnl excludes the fee."""
+    price = fnum(order.get("avgPx")) or fnum(order.get("px"))
+    fee = money_in_usdt(fnum(order.get("fee")), order.get("feeCcy"), price)
+    return fnum(order.get("pnl")) + fee
+
+def cfg(name):
+    values = state.settings or DEFAULT_SETTINGS
+    if name in values:
+        return values[name]
+    return DEFAULT_SETTINGS[name]
+
 def extra_trade_alert(result):
-    if result > PROFIT_ALERT_USD:
+    if result > float(cfg("profit_alert_usd")):
         return ROCKET_ALERT
-    if result < -LOSS_ALERT_USD:
+    if result < -float(cfg("loss_alert_usd")):
         return CLOWN_ALERT
     return None
+
+def fmt_ban_until(until_ts):
+    moment = datetime.fromtimestamp(float(until_ts), REPORT_TZ)
+    return moment.strftime("%Y-%m-%d %H:%M ") + str(REPORT_TZ)
+
+def ban_active(inst_id, now=None):
+    now = now or time.time()
+    ban = state.pair_bans.get(inst_id)
+    return bool(ban) and fnum(ban.get("until")) > now
+
+def pair_window_result(inst_id, now=None):
+    """Net result after the previous ban, inside the rolling window."""
+    now = now or time.time()
+    window = float(cfg("pair_ban_hours")) * 3600
+    start = now - window
+    ban = state.pair_bans.get(inst_id)
+    ignore_before = fnum(ban.get("until")) if ban else 0.0
+    total = 0.0
+    for event in state.trade_events:
+        if event.get("instId") != inst_id:
+            continue
+        ts = fnum(event.get("ts")) / 1000.0
+        if ts < start or ts <= ignore_before:
+            continue
+        total += event_result(event)
+    return total
+
+def consider_pair_ban(inst_id, now=None):
+    """Ban a pair for the configured hours once its window loss exceeds the limit."""
+    now = now or time.time()
+    if not inst_id or ban_active(inst_id, now):
+        return None
+    total = pair_window_result(inst_id, now)
+    limit = float(cfg("pair_loss_usd"))
+    if total >= -limit:
+        return None
+    until = now + float(cfg("pair_ban_hours")) * 3600
+    state.pair_bans[inst_id] = {
+        "until": until,
+        "triggered_at": now,
+        "loss": total,
+    }
+    return {"instId": inst_id, "until": until, "loss": total}
 
 async def order_size(order):
     """Contracts from order history, expressed as tokens and USDT notional."""
@@ -549,6 +643,14 @@ def load_trade_state():
         state.seen_lookup = set(state.seen_order_ids)
         state.order_history_ready = bool(state.seen_order_ids)
 
+    bans = payload.get("pair_bans") or {}
+    if isinstance(bans, dict):
+        state.pair_bans = {
+            str(inst): ban
+            for inst, ban in bans.items()
+            if isinstance(ban, dict) and fnum(ban.get("until")) > 0
+        }
+
     log(
         f"Loaded {len(state.trade_events)} closed trades "
         f"and {len(state.position_snapshots)} position cursors"
@@ -566,6 +668,12 @@ def save_trade_state():
         for pos_id, snap in state.position_snapshots.items()
         if int(fnum(snap.get("uTime"))) >= snap_cutoff
     }
+    ban_cutoff = time.time() - 14 * 86400
+    state.pair_bans = {
+        inst: ban
+        for inst, ban in state.pair_bans.items()
+        if fnum(ban.get("until")) >= ban_cutoff
+    }
 
     folder = os.path.dirname(TRADE_LOG_PATH)
     if folder:
@@ -580,6 +688,7 @@ def save_trade_state():
         "last_daily_date": state.last_daily_date,
         "day_open_balance": state.day_open_balance,
         "seen_order_ids": state.seen_order_ids[-2000:],
+        "pair_bans": state.pair_bans,
     }
     tmp = TRADE_LOG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -619,7 +728,7 @@ def report_status():
     idle = int(time.time() - state.last_order_activity)
     if state.is_sleeping:
         return "SLEEPING", idle
-    if idle < WATCHDOG_TIMEOUT:
+    if idle < float(cfg("watchdog_timeout")):
         return "OK", idle
     return "WARNING", idle
 
@@ -636,7 +745,7 @@ def render_summary_report(
         f"Period: {period}\n\n"
         f"Trades: {len(events)}\n"
         f"Volume: {volume:.2f} USDT\n"
-        f"Result: {fmt_result(result)}\n"
+        f"Result: {fmt_result_marked(result)}\n"
         f"Balance change: {fmt_pnl(balance_change)} USDT\n\n"
         f"Balance: {balance:.2f} USDT\n"
         f"Unrealized PnL: {fmt_pnl(unrealized)} USDT\n"
@@ -874,9 +983,9 @@ async def startup_report():
         f"Balance: {bal:.2f} USDT\n"
         f"Orders: {orders}\n"
         f"Positions: {pos}\n"
-        f"Stuck order timeout: {WATCHDOG_TIMEOUT}s\n"
-        f"Check interval: {CHECK_INTERVAL}s\n"
-        f"Trade alerts: order history every {CHECK_INTERVAL}s"
+        f"Stuck order timeout: {int(cfg('watchdog_timeout'))}s\n"
+        f"Check interval: {int(cfg('check_interval'))}s\n"
+        f"Trade alerts: order history every {int(cfg('check_interval'))}s"
     )
 
 def upcoming_hour(moment):
@@ -917,10 +1026,11 @@ async def publish_report(title, start_dt, end_dt, balance_basis):
 async def flush_due_reports():
     """Send every clock hour that is already due, and the daily report at midnight."""
     now = datetime.now(REPORT_TZ)
-    while state.next_report_at + timedelta(seconds=CHECK_INTERVAL) <= now:
+    interval = int(cfg("check_interval"))
+    while state.next_report_at + timedelta(seconds=interval) <= now:
         period_end = state.next_report_at
         period_start = period_end - timedelta(hours=1)
-        late = (now - period_end).total_seconds() > CHECK_INTERVAL + 30
+        late = (now - period_end).total_seconds() > interval + 30
         hour_events = events_between(period_start, period_end)
         try:
             # Skip empty hours missed while the process was down.
@@ -944,8 +1054,8 @@ async def flush_due_reports():
                     )
                     state.last_daily_date = day_key
         except Exception as e:
-            log(f"Report failed, retry in {CHECK_INTERVAL}s: {e}")
-            await asyncio.sleep(CHECK_INTERVAL)
+            log(f"Report failed, retry in {interval}s: {e}")
+            await asyncio.sleep(interval)
             return
 
         state.next_report_at = period_end + timedelta(hours=1)
@@ -962,7 +1072,7 @@ async def hourly_report():
         state.next_report_at = upcoming_hour(datetime.now(REPORT_TZ))
 
     while True:
-        wake_at = state.next_report_at + timedelta(seconds=CHECK_INTERVAL)
+        wake_at = state.next_report_at + timedelta(seconds=int(cfg("check_interval")))
         delay = (wake_at - datetime.now(REPORT_TZ)).total_seconds()
         if delay > 0:
             log(f"Next hourly report in {int(delay)}s ({REPORT_TZ})")
@@ -1001,37 +1111,9 @@ async def check_order_activity():
         log(f"Error checking order activity: {e}")
         return False
 
-async def cancel_stuck_orders():
-    """Cancel only orders whose own exchange update time is older than the timeout."""
-    orders = await get_pending_orders()
-    if not isinstance(orders, list):
-        return
-
-    now = time.time()
-    newest = None
-    stuck = []
-    for order in orders:
-        ord_id = str(order.get("ordId") or "")
-        updated = fnum(order.get("uTime")) / 1000.0
-        if not ord_id or updated <= 0:
-            continue
-        if newest is None or updated > newest:
-            newest = updated
-        if now - updated < WATCHDOG_TIMEOUT:
-            state.cancel_attempted.discard(ord_id)
-            continue
-        if ord_id in state.cancel_attempted:
-            continue
-        stuck.append(order)
-
-    if newest is not None:
-        state.last_order_activity = newest
-
-    if not stuck:
-        return
-
+async def cancel_listed_orders(orders):
     cancelled = []
-    for order in stuck:
+    for order in orders:
         ord_id = str(order.get("ordId") or "")
         result = await okx_request(
             "POST",
@@ -1041,17 +1123,67 @@ async def cancel_stuck_orders():
         if isinstance(result, dict) and result.get("code") == "0":
             state.cancel_attempted.add(ord_id)
             cancelled.append(order)
-            idle = int(now - fnum(order.get("uTime")) / 1000.0)
-            log(f"Cancelled stuck order {ord_id} {order.get('instId')} idle {idle}s")
         else:
-            log(f"Failed to cancel stuck order {ord_id}: {result}")
+            log(f"Failed to cancel order {ord_id}: {result}")
+    return cancelled
 
+async def cancel_stuck_orders():
+    """Cancel blacklisted pairs immediately, and orders that stopped moving."""
+    orders = await get_pending_orders()
+    if not isinstance(orders, list):
+        return
+
+    now = time.time()
+    timeout = float(cfg("watchdog_timeout"))
+    newest = None
+    stuck = []
+    blocked = []
+    for order in orders:
+        ord_id = str(order.get("ordId") or "")
+        updated = fnum(order.get("uTime")) / 1000.0
+        if not ord_id or updated <= 0:
+            continue
+        if newest is None or updated > newest:
+            newest = updated
+        inst_id = order.get("instId") or ""
+        if ban_active(inst_id, now):
+            if ord_id not in state.cancel_attempted:
+                blocked.append(order)
+            continue
+        if now - updated < timeout:
+            state.cancel_attempted.discard(ord_id)
+            continue
+        if ord_id in state.cancel_attempted:
+            continue
+        stuck.append(order)
+
+    if newest is not None:
+        state.last_order_activity = newest
+
+    if blocked:
+        removed = await cancel_listed_orders(blocked)
+        if removed:
+            lines = ["BLACKLIST ORDER REMOVED", ""]
+            for order in removed:
+                ban = state.pair_bans.get(order.get("instId")) or {}
+                lines.append(
+                    f"{order.get('instId')} {order.get('ordId')}\n"
+                    f"Pair blocked until {fmt_ban_until(ban.get('until') or now)}"
+                )
+            await tg("\n\n".join(lines), force=True)
+            log(f"Removed {len(removed)} order(s) on blacklisted pairs")
+
+    if not stuck:
+        return
+
+    cancelled = await cancel_listed_orders(stuck)
     if not cancelled:
         return
 
     lines = ["STUCK ORDERS CANCELLED", ""]
     for order in cancelled:
         idle = int(now - fnum(order.get("uTime")) / 1000.0)
+        log(f"Cancelled stuck order {order.get('ordId')} {order.get('instId')} idle {idle}s")
         lines.append(
             f"{order.get('instId')} {order.get('ordId')}\n"
             f"No movement for {idle}s"
@@ -1059,7 +1191,7 @@ async def cancel_stuck_orders():
     await tg("\n\n".join(lines), force=True)
 
 async def report_filled_orders():
-    """Read closed orders from exchange history. Do not derive PnL or percent."""
+    """Read closed orders and report the net result after the order fee."""
     rows = []
     for inst_type in ("SWAP", "FUTURES"):
         batch = await get_orders_history(inst_type)
@@ -1104,13 +1236,13 @@ async def report_filled_orders():
         except Exception as e:
             log(f"Failed to read order size {order.get('ordId')}: {e}")
             continue
-        result = fnum(order.get("pnl"))
+        result = order_net_result(order)
         await tg(
             f"TRADE CLOSED\n\n"
             f"{order.get('instId')}\n"
             f"Amount: {usdt:.2f} USDT\n"
             f"Tokens: {fmt_tokens(tokens)}\n"
-            f"Result: {fmt_result(result)}\n\n"
+            f"Result: {fmt_result_marked(result)}\n\n"
             f"Balance: {balance:.2f} USDT",
             force=True,
         )
@@ -1124,9 +1256,45 @@ async def report_filled_orders():
             "result": result,
             "ordId": str(order.get("ordId") or ""),
         })
-        log(f"Closed order {order.get('ordId')} {order.get('instId')} {fmt_result(result)}")
+        log(
+            f"Closed order {order.get('ordId')} {order.get('instId')} "
+            f"{fmt_result_marked(result)}"
+        )
 
-    remember_trades(recorded)
+    if not recorded:
+        return
+
+    state.trade_events.extend(recorded)
+    new_bans = []
+    seen_pairs = set()
+    for item in recorded:
+        inst_id = item.get("instId") or ""
+        if not inst_id or inst_id in seen_pairs:
+            continue
+        seen_pairs.add(inst_id)
+        ban = consider_pair_ban(inst_id)
+        if ban:
+            new_bans.append(ban)
+    try:
+        save_trade_state()
+    except Exception as e:
+        log(f"Failed to save trade log: {e}")
+
+    if not new_bans:
+        return
+
+    lines = ["PAIR BLACKLIST", ""]
+    for ban in new_bans:
+        lines.append(
+            f"{ban['instId']}\n"
+            f"12h result: {fmt_result_marked(ban['loss'])}\n"
+            f"New orders on this pair will be removed until {fmt_ban_until(ban['until'])}"
+        )
+    await tg("\n\n".join(lines), force=True)
+    try:
+        await cancel_stuck_orders()
+    except Exception as e:
+        log(f"Blacklist cancel error: {e}")
 
 async def watchdog():
     """Check stuck orders and order history on the same interval."""
@@ -1141,7 +1309,7 @@ async def watchdog():
         except Exception as e:
             log(f"Order history check error: {e}")
 
-        await asyncio.sleep(CHECK_INTERVAL)
+        await asyncio.sleep(max(1, int(cfg("check_interval"))))
 
 async def ping_service():
     """Periodic ping to keep connection alive and log status"""
@@ -1149,7 +1317,7 @@ async def ping_service():
         await asyncio.sleep(60)  # Every minute
         if state.panic_events == 0 and not state.is_sleeping:
             idle = int(time.time() - state.last_order_activity)
-            if idle > WATCHDOG_TIMEOUT - 30:  # Warning when close to timeout
+            if idle > float(cfg("watchdog_timeout")) - 30:
                 log(f"Warning: {idle}s since last order activity")
         
         # Log current status every 5 minutes
@@ -1159,6 +1327,153 @@ async def ping_service():
             status = "SLEEPING" if state.is_sleeping else "ACTIVE"
             log(f"Status: {status} | {orders} orders, {positions} positions, idle: {int(time.time() - state.last_order_activity)}s, panics: {state.panic_events}/{PANIC_THRESHOLD}")
 
+SETTING_LIMITS = {
+    "watchdog_timeout": (int, 30, 86400),
+    "check_interval": (int, 3, 3600),
+    "profit_alert_usd": (float, 0.01, 100000),
+    "loss_alert_usd": (float, 0.01, 100000),
+    "pair_loss_usd": (float, 0.01, 100000),
+    "pair_ban_hours": (float, 1, 168),
+}
+
+def sanitize_settings(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("settings must be an object")
+    cleaned = {}
+    for key, (cast, low, high) in SETTING_LIMITS.items():
+        if key not in raw:
+            continue
+        try:
+            value = cast(raw[key])
+        except (TypeError, ValueError):
+            raise ValueError(f"{key}: нужно число")
+        if value < low or value > high:
+            raise ValueError(f"{key}: от {low} до {high}")
+        cleaned[key] = value
+    if not cleaned:
+        raise ValueError("нет полей для сохранения")
+    return cleaned
+
+def load_settings():
+    state.settings = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        log(f"Settings unreadable, using defaults: {e}")
+        return
+    try:
+        state.settings.update(sanitize_settings(saved))
+    except Exception as e:
+        log(f"Settings ignored: {e}")
+
+def save_settings():
+    folder = os.path.dirname(SETTINGS_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    tmp = SETTINGS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state.settings, fh, indent=2)
+    os.replace(tmp, SETTINGS_PATH)
+
+def pair_stats():
+    now = time.time()
+    window = float(cfg("pair_ban_hours")) * 3600
+    groups = {}
+    for event in state.trade_events:
+        inst_id = event.get("instId") or "?"
+        row = groups.setdefault(inst_id, {
+            "instId": inst_id,
+            "trades": 0,
+            "volume": 0.0,
+            "result": 0.0,
+            "result_window": 0.0,
+        })
+        row["trades"] += 1
+        row["volume"] += event_volume(event)
+        result = event_result(event)
+        row["result"] += result
+        if fnum(event.get("ts")) / 1000.0 >= now - window:
+            row["result_window"] += result
+    rows = list(groups.values())
+    rows.sort(key=lambda row: row["result_window"])
+    return rows
+
+def blacklist_rows():
+    now = time.time()
+    rows = []
+    for inst_id, ban in state.pair_bans.items():
+        until = fnum(ban.get("until"))
+        if until <= now:
+            continue
+        rows.append({
+            "instId": inst_id,
+            "loss": fnum(ban.get("loss")),
+            "triggered_at": fnum(ban.get("triggered_at")),
+            "until": until,
+            "remaining_sec": int(until - now),
+        })
+    rows.sort(key=lambda row: row["until"])
+    return rows
+
+async def handle_index(_request):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")
+    if not os.path.isfile(path):
+        return aiohttp.web.Response(text="web/index.html missing", status=500)
+    return aiohttp.web.FileResponse(path)
+
+async def handle_state(_request):
+    return aiohttp.web.json_response({
+        "settings": state.settings,
+        "pairs": pair_stats(),
+        "blacklist": blacklist_rows(),
+        "timezone": str(REPORT_TZ),
+    })
+
+async def handle_settings(request):
+    try:
+        raw = await request.json()
+        cleaned = sanitize_settings(raw)
+    except Exception as e:
+        return aiohttp.web.json_response({"error": str(e)}, status=400)
+    state.settings.update(cleaned)
+    try:
+        save_settings()
+    except Exception as e:
+        return aiohttp.web.json_response({"error": str(e)}, status=500)
+    log("Settings updated from web UI")
+    return aiohttp.web.json_response({"settings": state.settings})
+
+async def handle_unban(request):
+    try:
+        raw = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({"error": "bad json"}, status=400)
+    inst_id = str(raw.get("instId") or "")
+    ban = state.pair_bans.get(inst_id)
+    if ban and ban_active(inst_id):
+        ban["until"] = time.time()
+        try:
+            save_trade_state()
+        except Exception as e:
+            log(f"Failed to save unban: {e}")
+        log(f"Pair unbanned from web UI: {inst_id}")
+    return aiohttp.web.json_response({"blacklist": blacklist_rows()})
+
+async def start_web():
+    app = aiohttp.web.Application()
+    app.router.add_get("/", handle_index)
+    app.router.add_get("/api/state", handle_state)
+    app.router.add_post("/api/settings", handle_settings)
+    app.router.add_post("/api/unban", handle_unban)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, "0.0.0.0", WEB_PORT)
+    await site.start()
+    log(f"Web UI on port {WEB_PORT}")
+
 async def main():
     if not all([
         OKX_API_KEY,
@@ -1167,6 +1482,7 @@ async def main():
     ]):
         raise RuntimeError("Missing OKX credentials")
 
+    load_settings()
     load_trade_state()
     if state.next_report_at is None:
         state.next_report_at = upcoming_hour(datetime.now(REPORT_TZ))
@@ -1180,10 +1496,16 @@ async def main():
         log(f"Warning: Could not fetch balance: {e}")
 
     await startup_report()
+    try:
+        await start_web()
+    except Exception as e:
+        log(f"Web UI failed: {e}")
+
     log(
-        f"OKXSTOPI started: order timeout={WATCHDOG_TIMEOUT}s, "
-        f"check interval={CHECK_INTERVAL}s, startup grace={STARTUP_GRACE}s, "
-        f"panic threshold={PANIC_THRESHOLD}, trade alerts every {CHECK_INTERVAL}s"
+        f"OKXSTOPI started: order timeout={int(cfg('watchdog_timeout'))}s, "
+        f"check interval={int(cfg('check_interval'))}s, startup grace={STARTUP_GRACE}s, "
+        f"panic threshold={PANIC_THRESHOLD}, trade alerts every {int(cfg('check_interval'))}s, "
+        f"web port={WEB_PORT}"
     )
 
     # Run all tasks
