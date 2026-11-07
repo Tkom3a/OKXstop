@@ -1,148 +1,138 @@
 # OKXSTOP
-  
-Экстренный стоп-кран для OKX (аварийный выключатель для торговых терминалов, таких как MoonTrader и MoonBot). Скрипт следит за каждым открытым ордером отдельно: если этот ордер не менялся дольше `WATCHDOG_TIMEOUT` секунд, снимается только он.
 
-С тем же интервалом (`CHECK_INTERVAL`) читает историю ордеров. В Telegram уходят пара, сумма в USDT, количество токенов и чистый результат после комиссии биржи. Перед суммой стоит зелёный кружок у профита и красный у убытка. В конце сообщения — баланс торгового счёта.
+Сторож фьючерсных ордеров OKX для MoonTrader и MoonBot. Он не закрывает позиции и не снимает все ордера разом. У каждого открытого ордера свой таймер по времени последнего изменения на бирже (`uTime`). Если ордер не менялся дольше `WATCHDOG_TIMEOUT` секунд, снимается только он.
 
-Если по паре за `PAIR_BAN_HOURS` часов чистый убыток больше `PAIR_LOSS_USD`, пара попадает в чёрный список на тот же срок. Новые ордера по ней снимаются сразу, не дожидаясь таймаута. Страница настроек, результатов по парам и текущего чёрного списка открывается на порту `WEB_PORT` (по умолчанию 8080).
+С тем же периодом (`CHECK_INTERVAL`, по умолчанию 10 секунд) скрипт читает историю исполненных ордеров SWAP и FUTURES. Первая проверка только запоминает уже существующие ордера и в Telegram их не шлёт. Дальше по каждому новому закрытию уходит сообщение: пара, сумма в USDT, количество токенов и чистый результат. Чистый результат — это PnL ордера плюс его комиссия. Комиссия на OKX приходит со знаком минус и поэтому вычитается. Если она списана в монете, а не в USDT, сумма переводится по цене исполнения. Процент PnL не считается. Перед суммой стоит 🟢 у профита и 🔴 у убытка. У нуля кружка нет. В конце сообщения — баланс торгового счёта.
 
-Та же сводка приходит каждый час и в полночь по `REPORT_TIMEZONE` — полным отчётом за прошедшие сутки. Сделки, закрытые до запуска скрипта, в личные сообщения не дублируются; часовой и суточный отчёты считают только закрытия после старта.
-  
-Также присылает отбивки и статистику в Telegram в формате:  
-  
----  
-  
-🟢 OKXSTOPI STARTED  
-  
-Balance: 4987.40 USDT  
-Orders: 0  
-Positions: 0  
-Timeout: 120s  
-Check interval: 10s  
-Trade alerts: on close, hourly, and daily  
-Panic threshold: 3 (sleep mode after)  
-  
----  
-  
-OKXSTOPI HOURLY REPORT  
-  
-Period: 2026-10-12 11:00 UTC — 2026-10-12 12:00 UTC  
-  
-Trades: 13  
-Volume: 20.35 USDT  
-Result: 🟢 +10$  
-Balance change: +0.05 USDT  
-  
-Balance: 939.64 USDT  
-Unrealized PnL: +0.00 USDT  
-Open orders: 100  
-Open positions: 0  
-  
-Status: OK  
-Last order activity: 5s ago  
-Panic events: 0/3  
-  
----  
-  
-OKXSTOPI DAILY REPORT  
-  
-Period: 2026-10-12 00:00 UTC — 2026-10-13 00:00 UTC  
-  
-Trades: 40  
-Volume: 180.00 USDT  
-Result: 🟢 +18$  
-Balance change: +1.05 USDT  
-  
-Balance: 940.69 USDT  
-Unrealized PnL: +0.00 USDT  
-Open orders: 100  
-Open positions: 0  
-  
-Status: OK  
-Last order activity: 5s ago  
-Panic events: 0/3  
-  
----  
-  
-🚨 OKXSTOPI PANIC #1  
-  
-No order activity for 120s  
-Last activity: 2026-06-18 13:45 UTC  
-  
-Orders cancelled: 0  
-Positions closed: 0  
-Balance: 4987.40 USDT  
-Remaining panics until sleep: 2  
-  
----  
-  
-💤 OKXSTOPI ENTERING SLEEP MODE  
-  
-Panic events: 3 (threshold: 3)  
-Watchdog is now sleeping until new trading activity is detected.  
-No more panic notifications will be sent.  
-  
-Current balance: 4987.40 USDT  
-  
----  
-  
-🟢 OKXSTOPI RESUMED  
-  
-Activity detected - Watchdog is active again!  
-  
----  
-  
-TRADE CLOSED  
-  
-BTC-USDT-SWAP  
-Amount: 125.40 USDT  
-Tokens: 0.0021  
-Result: 🟢 +10$  
-  
-Balance: 939.64 USDT  
-  
----  
-  
-🚀  
-  
----  
-  
-TRADE CLOSED  
-  
-ETH-USDT-SWAP  
-Amount: 80.00 USDT  
-Tokens: 0.03  
-Result: 🔴 -16$  
-  
-Balance: 923.64 USDT  
-  
----  
-  
-🤡  
-  
----  
-  
-## Установка  
-  
-git clone https://github.com/Tkom3a/OKXstopi.git  
-cd OKXstopi  
-Создаем .env файл(шаблон env.example находится  в репозитории проекта) и заполниям все переменные  
-  
+Если чистый результат больше `PROFIT_ALERT_USD` (по умолчанию 5$), следом отдельным сообщением уходит 🚀. Если убыток больше `LOSS_ALERT_USD` (по умолчанию 15$), отдельным сообщением уходит 🤡. Ровно 5$ и ровно 15$ отдельное сообщение не вызывают.
 
-# Билд и запуск  
-  
-docker-compose build --no-cache  
+Каждый час и в полночь по `REPORT_TIMEZONE` приходит сводка. Полночный отчёт — за прошедшие сутки. Пустые часы, пропущенные пока процесс был выключен, не досылаются. Час, который только что закончился, отправляется всегда. В сводку попадают только закрытия, записанные после старта.
+
+Если по паре за `PAIR_BAN_HOURS` часов (по умолчанию 12) чистый убыток становится больше `PAIR_LOSS_USD` (по умолчанию 20$), пара попадает в чёрный список на тот же срок. Отсчёт идёт от момента, когда убыток пересёк порог. Новые убытки внутри этого срока запрет не продлевают. После окончания старые сделки сами запрет не включают снова: нужна новая просадка больше порога. Ровно 20$ запрет не включают. Пока пара в списке, любой новый ордер по ней снимается на ближайшей проверке, не дожидаясь таймаута зависшего ордера. Снимается и ордер на закрытие позиции. Срок можно снять раньше на веб-странице.
+
+Страница сервиса открывается на `WEB_PORT` (по умолчанию 8080): http://localhost:8080. На ней меняются таймаут, интервал проверки, пороги ракеты и клоуна, лимит убытка и срок чёрного списка, виден результат по парам и пары, которые сейчас в запрете. Пароля нет, порт не стоит публиковать в интернет. Сохранённые настройки лежат в `data/settings.json` и после первого сохранения важнее значений из `.env`. Журнал сделок и чёрный список — в `data/trade_events.json`.
+
+`WATCHDOG_TIMEOUT` задаётся в секундах. 10 минут — это 600.
+
+## Сообщения в Telegram
+
+Старт:
+
+```
+OKXSTOPI STARTED
+
+Balance: 4987.40 USDT
+Orders: 0
+Positions: 0
+Stuck order timeout: 600s
+Check interval: 10s
+Trade alerts: order history every 10s
+```
+
+Закрытие с профитом больше 5$:
+
+```
+TRADE CLOSED
+
+BTC-USDT-SWAP
+Amount: 125.40 USDT
+Tokens: 0.0021
+Result: 🟢 +10$
+
+Balance: 939.64 USDT
+```
+
+```
+🚀
+```
+
+Закрытие с убытком больше 15$:
+
+```
+TRADE CLOSED
+
+ETH-USDT-SWAP
+Amount: 80.00 USDT
+Tokens: 0.03
+Result: 🔴 -16$
+
+Balance: 923.64 USDT
+```
+
+```
+🤡
+```
+
+Зависший ордер:
+
+```
+STUCK ORDERS CANCELLED
+
+BTC-USDT-SWAP 123456789
+No movement for 610s
+```
+
+Чёрный список и снятие ордера по запрещённой паре:
+
+```
+PAIR BLACKLIST
+
+SOL-USDT-SWAP
+12h result: 🔴 -22$
+New orders on this pair will be removed until 2026-11-07 22:11 UTC
+```
+
+```
+BLACKLIST ORDER REMOVED
+
+SOL-USDT-SWAP 987654321
+Pair blocked until 2026-11-07 22:11 UTC
+```
+
+Часовой отчёт. Суточный устроен так же, заголовок `OKXSTOPI DAILY REPORT`, период — предыдущие сутки. `Status: OK`, пока самое свежее изменение ордера моложе таймаута, иначе `WARNING`.
+
+```
+OKXSTOPI HOURLY REPORT
+
+Period: 2026-10-12 11:00 UTC — 2026-10-12 12:00 UTC
+
+Trades: 13
+Volume: 20.35 USDT
+Result: 🟢 +10$
+Balance change: +0.05 USDT
+
+Balance: 939.64 USDT
+Unrealized PnL: +0.00 USDT
+Open orders: 100
+Open positions: 0
+
+Status: OK
+Last order activity: 5s ago
+Panic events: 0/3
+```
+
+## Установка
+
+```
+git clone https://github.com/Tkom3a/OKXstop.git
+cd OKXstop
+```
+
+Скопируйте `.env.example` в `.env` и заполните ключи OKX и Telegram. Для часовых отчётов по Москве укажите `REPORT_TIMEZONE=Europe/Moscow`.
+
+```
+docker-compose build --no-cache
 docker-compose up -d
+```
 
-Веб-морда: http://localhost:8080  
-  
+Веб-морда: http://localhost:8080
 
-# Логи  
-  
-docker logs -f okxstopi  
+```
+docker logs -f okxstopi
+```
 
-# Остановка и удаление  
-  
-docker-compose down  
-docker rmi okxstopi_okxstopi  
-# OKXmbStop
+Остановка:
+
+```
+docker-compose down
+```
