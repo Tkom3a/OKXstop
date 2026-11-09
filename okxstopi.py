@@ -1492,7 +1492,7 @@ def set_session_cookie(response):
 
 @aiohttp.web.middleware
 async def web_auth(request, handler):
-    if request.path in ("/", "/api/login"):
+    if request.path in ("/", "/api/login", "/favicon.png", "/favicon.ico"):
         return await handler(request)
     if not WEB_PASSWORD:
         return aiohttp.web.json_response(
@@ -1534,10 +1534,19 @@ async def handle_logout(_request):
     response.del_cookie(SESSION_COOKIE, path="/")
     return response
 
+def web_file(name):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", name)
+
 async def handle_index(_request):
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html")
+    path = web_file("index.html")
     if not os.path.isfile(path):
         return aiohttp.web.Response(text="web/index.html missing", status=500)
+    return aiohttp.web.FileResponse(path)
+
+async def handle_favicon(_request):
+    path = web_file("favicon.png")
+    if not os.path.isfile(path):
+        return aiohttp.web.Response(status=404)
     return aiohttp.web.FileResponse(path)
 
 async def handle_state(_request):
@@ -1581,6 +1590,8 @@ async def handle_unban(request):
 async def start_web():
     app = aiohttp.web.Application(middlewares=[web_auth])
     app.router.add_get("/", handle_index)
+    app.router.add_get("/favicon.png", handle_favicon)
+    app.router.add_get("/favicon.ico", handle_favicon)
     app.router.add_post("/api/login", handle_login)
     app.router.add_post("/api/logout", handle_logout)
     app.router.add_get("/api/state", handle_state)

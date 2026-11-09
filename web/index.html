@@ -4,18 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OKXSTOP</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<meta name="theme-color" content="#070707">
+<meta name="color-scheme" content="dark">
 <style>
   :root {
-    --bg: #101410;
-    --card: #1a211c;
-    --line: #2c3830;
-    --text: #e7eee4;
-    --muted: #8ea094;
-    --green: #1f9d57;
-    --green-ink: #d8ffe8;
-    --red: #d4534a;
-    --red-ink: #ffe4e1;
-    --field: #0e1410;
+    --bg: #070707;
+    --card: #111111;
+    --line: #2a2a2a;
+    --text: #e6e6e6;
+    --muted: #8d8d8d;
+    --green: #d8d8d8;
+    --green-ink: #9dcaa8;
+    --red: #c46a64;
+    --red-ink: #e08b86;
+    --field: #0c0c0c;
   }
   * { box-sizing: border-box; }
   body {
@@ -23,6 +26,7 @@
     background: var(--bg);
     color: var(--text);
     font: 15px/1.45 "Segoe UI", "PT Sans", sans-serif;
+    color-scheme: dark;
   }
   main { max-width: 980px; margin: 0 auto; padding: 28px 18px 48px; }
   h1 { font-size: 22px; font-weight: 650; margin: 0 0 4px; letter-spacing: 0.04em; }
@@ -50,17 +54,23 @@
     padding: 8px 10px;
     font: inherit;
   }
+  input:focus {
+    outline: 1px solid #6a6a6a;
+    border-color: #6a6a6a;
+  }
   .row { display: flex; gap: 10px; align-items: center; margin-top: 14px; }
   button {
-    background: var(--green);
-    color: #fff;
+    background: #e4e4e4;
+    color: #111;
     border: 0;
     border-radius: 8px;
     padding: 8px 14px;
     font: inherit;
     cursor: pointer;
   }
-  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  button:hover { background: #f4f4f4; }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid #3a3a3a; }
+  button.ghost:hover { background: #1a1a1a; }
   button:disabled { opacity: 0.5; cursor: default; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
