@@ -27,7 +27,7 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT", "120"))
+WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT", "600"))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))  # How often to check orders
 PROFIT_ALERT_USD = float(os.getenv("PROFIT_ALERT_USD", "5"))
 LOSS_ALERT_USD = float(os.getenv("LOSS_ALERT_USD", "15"))
@@ -992,7 +992,7 @@ async def startup_report():
         f"Balance: {bal:.2f} USDT\n"
         f"Orders: {orders}\n"
         f"Positions: {pos}\n"
-        f"Stuck order timeout: {int(cfg('watchdog_timeout'))}s\n"
+        f"All orders idle timeout: {int(cfg('watchdog_timeout'))}s\n"
         f"Check interval: {int(cfg('check_interval'))}s\n"
         f"Trade alerts: order history every {int(cfg('check_interval'))}s"
     )
@@ -1137,7 +1137,7 @@ async def cancel_listed_orders(orders):
     return cancelled
 
 async def cancel_stuck_orders():
-    """Cancel blacklisted pairs immediately, and orders that stopped moving."""
+    """Cancel a banned pair at once. Cancel every order only when none of them moved."""
     orders = await get_pending_orders()
     if not isinstance(orders, list):
         return
@@ -1145,7 +1145,7 @@ async def cancel_stuck_orders():
     now = time.time()
     timeout = float(cfg("watchdog_timeout"))
     newest = None
-    stuck = []
+    tracked = []
     blocked = []
     for order in orders:
         ord_id = str(order.get("ordId") or "")
@@ -1159,12 +1159,7 @@ async def cancel_stuck_orders():
             if ord_id not in state.cancel_attempted:
                 blocked.append(order)
             continue
-        if now - updated < timeout:
-            state.cancel_attempted.discard(ord_id)
-            continue
-        if ord_id in state.cancel_attempted:
-            continue
-        stuck.append(order)
+        tracked.append(order)
 
     if newest is not None:
         state.last_order_activity = newest
@@ -1182,22 +1177,34 @@ async def cancel_stuck_orders():
             await tg("\n\n".join(lines), force=True)
             log(f"Removed {len(removed)} order(s) on blacklisted pairs")
 
-    if not stuck:
+    # One fresh order means the terminal is alive, so old orders stay.
+    if newest is None or now - newest < timeout:
+        for order in tracked:
+            state.cancel_attempted.discard(str(order.get("ordId") or ""))
         return
 
-    cancelled = await cancel_listed_orders(stuck)
+    frozen = [
+        order for order in tracked
+        if str(order.get("ordId") or "") not in state.cancel_attempted
+    ]
+    if not frozen:
+        return
+
+    cancelled = await cancel_listed_orders(frozen)
     if not cancelled:
         return
 
-    lines = ["STUCK ORDERS CANCELLED", ""]
+    idle = int(now - newest)
+    lines = [
+        "ORDERS CANCELLED",
+        "",
+        f"No placed order moved for {idle}s",
+        "",
+    ]
     for order in cancelled:
-        idle = int(now - fnum(order.get("uTime")) / 1000.0)
-        log(f"Cancelled stuck order {order.get('ordId')} {order.get('instId')} idle {idle}s")
-        lines.append(
-            f"{order.get('instId')} {order.get('ordId')}\n"
-            f"No movement for {idle}s"
-        )
-    await tg("\n\n".join(lines), force=True)
+        log(f"Cancelled order {order.get('ordId')} {order.get('instId')} after {idle}s without any movement")
+        lines.append(f"{order.get('instId')} {order.get('ordId')}")
+    await tg("\n".join(lines), force=True)
 
 async def report_filled_orders():
     """Read closed orders and report the net result after the order fee."""
